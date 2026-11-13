@@ -1,0 +1,127 @@
+name: ${COMPOSE_PROJECT_NAME:-zeaops-dev}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-api: &api
+  image: zeaops-api:0.1.0-dev
+  environment:
+    ZEAOPS_ENVIRONMENT: development
+    ZEAOPS_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Run scripts/setup.ps1}:${POSTGRES_PASSWORD:?Run scripts/setup.ps1}@postgres:5432/${POSTGRES_DB:?Run scripts/setup.ps1}
+    ZEAOPS_LOG_LEVEL: ${ZEAOPS_LOG_LEVEL:-INFO}
+  networks: [control-plane]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+  init: true
+  cpus: 1.0
+  mem_limit: 512m
+  memswap_limit: 512m
+  pids_limit: 128
+  logging: *logging
+
+services:
+  postgres:
+    image: zeaops-postgres:17.12-dev
+    build:
+      context: ../..
+      dockerfile: infrastructure/compose/postgres.Dockerfile
+    user: "999:999"
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=32m"
+      - "/var/run/postgresql:rw,noexec,nosuid,size=16m,uid=999,gid=999,mode=0775"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Run scripts/setup.ps1}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/setup.ps1}
+      POSTGRES_DB: ${POSTGRES_DB:?Run scripts/setup.ps1}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports: ["127.0.0.1:18432:5432"]
+    volumes: [metadata-pg17:/var/lib/postgresql/data]
+    networks: [control-plane]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 30s
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    logging: *logging
+
+  migrate:
+    <<: *api
+    command: [alembic, -c, apps/api/alembic.ini, upgrade, head]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    <<: *api
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    ports: ["127.0.0.1:18301:18301"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18301/health/ready', timeout=6)",
+        ]
+      interval: 10s
+      timeout: 8s
+      retries: 10
+
+  web:
+    image: zeaops-web:0.1.0-dev
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+    environment:
+      ZEAOPS_API_INTERNAL_URL: http://api:18301
+    ports: ["127.0.0.1:18300:18300"]
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [control-plane]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=32m"
+      - "/app/apps/web/.next/cache:rw,nosuid,size=32m,uid=1000,gid=1000"
+    init: true
+    cpus: 1.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    logging: *logging
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:18300').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  metadata-pg17:
+
+networks:
+  control-plane:
+    driver: bridge

@@ -1,0 +1,29 @@
+{
+  "name": "@zeaops/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port 18300",
+    "build": "next build",
+    "start": "next start --hostname 127.0.0.1 --port 18300",
+    "typecheck": "next typegen && tsc --noEmit"
+  },
+  "dependencies": {
+    "@zeaops/ui": "workspace:*",
+    "@zeaops/api-client": "workspace:*",
+    "@zeaops/contracts": "workspace:*",
+    "next": "16.4.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "@tanstack/react-query": "5.107.1",
+    "react-hook-form": "7.92.0",
+    "@hookform/resolvers": "7.0.6",
+    "zod": "4.6.7",
+    "lucide-react": "1.72.0"
+  },
+  "devDependencies": {
+    "tailwindcss": "4.3.5",
+    "@tailwindcss/postcss": "4.3.5",
+    "postcss": "8.5.32"
+  }
+}

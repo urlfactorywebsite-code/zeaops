@@ -1,0 +1,106 @@
+name: Foundation CI
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: foundation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.22.3
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.10
+      - name: Install pinned package managers and locked dependencies
+        run: |
+          npm install --global pnpm@11.3.0
+          python -m pip install uv==0.13.8
+          pnpm install --frozen-lockfile
+          python -m uv sync --system-certs --locked
+          pnpm exec playwright install --with-deps chromium
+      - name: Create isolated development configuration
+        shell: pwsh
+        run: ./scripts/setup.ps1 -SkipInstall
+      - name: Format, lint, static types, unit tests, and build
+        shell: pwsh
+        run: ./scripts/check.ps1 -Security
+      - name: Start PostgreSQL and migrate
+        shell: pwsh
+        run: ./scripts/dev.ps1 -Mode infra
+      - name: Verify real PostgreSQL and migration drift
+        env:
+          ZEAOPS_RUN_INTEGRATION: "1"
+        run: |
+          python -m uv run --locked pytest -m integration
+          python -m uv run --locked alembic -c apps/api/alembic.ini check
+      - name: Start native API and verify browser integration
+        run: |
+          .venv/bin/uvicorn zeaops.main:create_app --factory --app-dir apps/api/src --host 127.0.0.1 --port 18301 --no-access-log > "$RUNNER_TEMP/zeaops-api.log" 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true; wait "$api_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent --connect-timeout 2 --max-time 6 http://127.0.0.1:18301/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --max-time 6 http://127.0.0.1:18301/health/ready
+          pnpm test:e2e
+      - name: Build and health-check the complete local container stack
+        shell: pwsh
+        run: ./scripts/dev.ps1 -Mode stack
+      - name: Verify actual container proxy and backend
+        run: |
+          curl --fail --silent --max-time 6 http://127.0.0.1:18301/health/ready
+          curl --fail --silent --max-time 8 http://127.0.0.1:18300/api/health/ready
+      - name: Prove fresh database initialization and migration replay in isolation
+        shell: pwsh
+        run: ./scripts/smoke.ps1
+      - name: Inspect actual container permissions, limits, and storage isolation
+        run: python -m uv run --locked python scripts/verify_runtime.py
+      - name: Scan source secrets and high/critical image vulnerabilities
+        run: |
+          curl --fail --location --max-time 120 https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+          mkdir "$RUNNER_TEMP/zeaops-source"
+          git archive HEAD | tar -xf - -C "$RUNNER_TEMP/zeaops-source"
+          mkdir "$RUNNER_TEMP/zeaops-audit"
+          "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/zeaops-source" --redact --no-banner --report-format json --report-path "$RUNNER_TEMP/zeaops-audit/gitleaks.json"
+          curl --fail --location --max-time 120 https://github.com/aquasecurity/trivy/releases/download/v0.76.2/trivy_0.76.2_Linux-64bit.tar.gz -o "$RUNNER_TEMP/trivy.tar.gz"
+          echo "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf  $RUNNER_TEMP/trivy.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP" trivy
+          audit_exit=0
+          for image in zeaops-api:0.1.0-dev zeaops-web:0.1.0-dev zeaops-postgres:17.12-dev; do
+            docker save --output "$RUNNER_TEMP/zeaops-image.tar" "$image"
+            report_name="${image%%:*}"
+            "$RUNNER_TEMP/trivy" image --input "$RUNNER_TEMP/zeaops-image.tar" --scanners vuln --format json --output "$RUNNER_TEMP/zeaops-audit/$report_name.json" --timeout 5m
+            "$RUNNER_TEMP/trivy" image --input "$RUNNER_TEMP/zeaops-image.tar" --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --timeout 5m || audit_exit=1
+          done
+          exit "$audit_exit"
+      - name: Retain redacted audit reports
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: zeaops-security-audit
+          path: ${{ runner.temp }}/zeaops-audit/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Stop only this project's containers
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path .env) { ./scripts/dev.ps1 -Mode stop }

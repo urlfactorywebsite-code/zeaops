@@ -1,0 +1,11 @@
+packages:
+  - apps/web
+  - packages/*
+minimumReleaseAgeExclude:
+  - prettier@3.10.1
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+overrides:
+  # GHSA-g3hv-75wg-m249: estree's 10.x range has no patched release.
+  "@typescript-eslint/typescript-estree>minimatch": "11.0.8"

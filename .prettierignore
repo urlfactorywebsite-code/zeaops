@@ -1,0 +1,10 @@
+pnpm-lock.yaml
+uv.lock
+.venv
+.next
+node_modules
+playwright-report
+test-results
+*.py
+*.ps1
+**/next-env.d.ts
