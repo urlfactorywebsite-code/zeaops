@@ -23,6 +23,12 @@ test-results/
 .tools/
 .artifacts/
 secrets/
+.secrets/
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+*.ppk
 *.pem
 *.key
 *.p12

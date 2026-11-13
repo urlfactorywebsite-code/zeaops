@@ -51,7 +51,7 @@ The MIT Kerberos release announcement and advisory supplied additional upstream 
 Changes made:
 
 - Removed the unused `mount` package from API and Web runtime stages. Each removal eliminates four
-  HIGH findings and one MEDIUM/LOW finding each. Debian Essential packages and package metadata remain intact.
+  HIGH findings, one MEDIUM finding, and one LOW finding per image. Debian Essential packages and package metadata remain intact.
 - Removed PostgreSQL's unused GnuPG tooling and orphaned libraries: `dirmngr`, `gnupg`, `gnupg-l10n`,
   `gpg`, `gpg-agent`, `gpgconf`, `gpgsm`, `pinentry-curses`, `libassuan9`, `libgnutls30t64`, `libksba8`,
   `libnpth0t64`, `libp11-kit0`, and `libtasn1-6`. This eliminates seven HIGH findings and 14 installed
@@ -172,7 +172,7 @@ gate's HIGH/CRITICAL rows and does not certify lower severities as harmless.
 - Gitleaks/Trivy downloads are version- and SHA-256-pinned. Audit artifacts contain redacted source
   results and image reports, not `.env`, database dumps, or container environment inspection output.
   Retention is seven days. Strict HIGH/CRITICAL exit code 1 includes unfixed findings.
-- `git check-ignore --no-index` passed for 22 representative secret/generated paths and preserved
+- `git check-ignore --no-index` passed for 28 representative secret/generated paths and preserved
   five source/example paths. No real dotenv file is tracked. The repository has no commits, so
   there is no existing commit history to scan; source/build checks and Gitleaks cover current files.
 - Hosted CI was not triggered. Source review and local equivalents pass except the unchanged
@@ -265,14 +265,85 @@ rebuilt local images; only the image security gate fails.
 | Production / VPS operations                                                            | NOT RUN | No production credentials, connections, deployment, or privileged management actions used                                                |
 
 **82 automated tests passed**: 19 Vitest + 53 backend/unit/tooling + 2 real database + 8 browser.
-The immediate recovery assertion after PostgreSQL became healthy initially received 503: the API's
+The final security refinement reran that aggregate suite; the integration pair was run again after
+the local collation repair and its new assertion. Repeated executions are not counted as extra tests.
+
+During the earlier follow-up, the immediate recovery assertion after PostgreSQL became healthy initially received 503: the API's
 single bounded readiness worker was still completing its outage probe. A subsequent bounded recovery
 probe returned 200, and runtime health passed. Recovery is eventual rather than synchronized to the
 PostgreSQL container health transition; no API restart was needed. The outage checks observed live
-200 in 0.03 seconds and API/proxy readiness 503 in 4.00/4.01 seconds respectively.
+200 in 0.03 seconds and API/proxy readiness 503 in 4.00/4.01 seconds respectively. The final security
+run repeated the real database outage/recovery check: API liveness returned 200 in 0.06 seconds,
+readiness returned 503 in 4.00 seconds, and bounded polling confirmed recovery without an API restart.
 
 The original deprecation warning from Starlette's HTTPX client is resolved. Terminal color warnings
 from the host are non-failing and unrelated to application behavior.
+
+### Exact image, exposure, and local-repair commands
+
+Run from the repository root. `Invoke-Compose` enforces the exact local environment and local Docker
+socket before invoking Compose. Builds re-executed the changed runtime package layers; unchanged
+builder layers were cached. These substantive verification/remediation commands supplement the full
+frontend/backend command table above:
+
+```powershell
+. ./scripts/common.ps1
+Invoke-Compose -ComposeArguments @('config', '--quiet')
+Invoke-Compose -ComposeArguments @('--progress', 'plain', 'build')
+Invoke-Compose -ComposeArguments @('up', '-d', '--wait')
+./scripts/check.ps1 -Integration -Browser -Security
+./scripts/smoke.ps1
+python -m uv run --locked python scripts/verify_runtime.py
+
+# Read-only local runtime exposure checks, without malicious XML or a database mutation.
+Invoke-Compose -ComposeArguments @('exec', '-T', 'postgres', 'psql', '-U', 'zeaops_dev', '-d', 'zeaops_metadata_dev', '-Atc', "SELECT xmlparse(document '<zeaops/>') IS NOT NULL; SELECT DISTINCT auth_method FROM pg_hba_file_rules ORDER BY auth_method;")
+Invoke-Compose -ComposeArguments @('exec', '-T', 'postgres', 'psql', '-U', 'zeaops_dev', '-d', 'zeaops_metadata_dev', '-Atc', 'SHOW krb_server_keyfile;')
+
+# Executed only after the ignored pg_dump archive was created and pg_restore --list succeeded.
+# These repaired only the existing isolated development metadata database.
+Invoke-Compose -ComposeArguments @('exec', '-T', 'postgres', 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'zeaops_dev', '-d', 'zeaops_metadata_dev', '-c', 'REINDEX DATABASE zeaops_metadata_dev;')
+Invoke-Compose -ComposeArguments @('exec', '-T', 'postgres', 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'zeaops_dev', '-d', 'zeaops_metadata_dev', '-c', 'ALTER DATABASE zeaops_metadata_dev REFRESH COLLATION VERSION;')
+```
+
+Image scans used Trivy **0.76.2**, the same severity policy as CI, and freshly exported archives.
+The full scan commands exit 0 on successful inventory; each strict gate command exits **1** for
+the retained findings. The exit was recorded for each image rather than treated as a passing scan:
+
+```powershell
+. ./scripts/common.ps1
+Assert-LocalDocker
+foreach ($role in @('api', 'web', 'postgres')) {
+    $image = switch ($role) {
+        'api' { 'zeaops-api:0.1.0-dev' }
+        'web' { 'zeaops-web:0.1.0-dev' }
+        'postgres' { 'zeaops-postgres:17.12-dev' }
+    }
+    Invoke-Checked -Executable docker -Arguments @('image', 'save', '--output', ".artifacts/final-security/$role.tar", $image)
+    Invoke-Checked -Executable ./.tools/trivy.exe -Arguments @('image', '--cache-dir', '.artifacts/security/trivy-cache', '--input', ".artifacts/final-security/$role.tar", '--scanners', 'vuln', '--format', 'json', '--output', ".artifacts/final-security/trivy-$role.json", '--timeout', '5m')
+    & ./.tools/trivy.exe image --cache-dir .artifacts/security/trivy-cache --input ".artifacts/final-security/$role.tar" --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output ".artifacts/final-security/gate-$role.json" --timeout 5m
+    Write-Host "Strict gate ${role}: exit $LASTEXITCODE"
+}
+```
+
+Disposable exposure inventories used `docker run --rm --network none --read-only --cap-drop ALL
+--security-opt no-new-privileges --entrypoint /bin/sh ...` with `dpkg-query -W`, `find`, and `ldd`
+against actual ELF binaries. `/usr/bin/psql` is a Perl wrapper; the ELF dependency check targets
+`/usr/lib/postgresql/17/bin/psql`. No required shared library was missing. Separate actual commands
+were `node -p process.versions.sqlite`, `python -c 'import sqlite3; print(sqlite3.sqlite_version)'`,
+and `perl -MArchive::Tar -e 'print $Archive::Tar::VERSION'`, each inside the corresponding isolated
+image. Expected missing-module exits in API/Web are exposure evidence, not failed application tests.
+
+The source scan command was `./.tools/gitleaks.exe dir .artifacts/final-security/source --redact
+--no-banner --report-format json --report-path .artifacts/final-security/gitleaks.json`; the snapshot
+contains only Git-selected source, including untracked implementation files and excluding ignored
+local state. The separate source/build check also searches for the actual generated local password
+without printing it.
+
+The local Windows scanner archives were rechecked against freshly retrieved publisher checksums;
+installed executables match their verified ZIP members. CI's Linux archive checksums also match the
+current publisher checksum files. Evidence is retained in `*-publisher-checksums.txt`. Docker Desktop
+OCI indexes changed when build provenance was regenerated; the scanned root filesystem layer digests
+match the current running images, recorded in `.artifacts/final-security/image-binding.json`.
 
 ## Remaining security findings and release decision
 
